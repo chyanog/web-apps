@@ -789,7 +789,9 @@ const DigitFlow = (() => {
     return count > 3000 ? .76 : count > 500 ? 1.10 : 1.65;
   }
 
-  function line(context, edge, palette) {
+  const mixPoint = (a, b, t) => ({ x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t });
+
+  function line(context, edge, palette, portion = 1) {
     const { start, end, first, second, from, to } = edge;
     let stroke = palette[from];
     if (palette[from] !== palette[to]) {
@@ -800,7 +802,17 @@ const DigitFlow = (() => {
     context.strokeStyle = stroke;
     context.beginPath();
     context.moveTo(start.x, start.y);
-    context.bezierCurveTo(first.x, first.y, second.x, second.y, end.x, end.y);
+    if (portion === 1) {
+      context.bezierCurveTo(first.x, first.y, second.x, second.y, end.x, end.y);
+    } else {
+      // Subdivide the original cubic, keeping its gradient fixed as the tip advances.
+      const a = mixPoint(start, first, portion);
+      const b = mixPoint(first, second, portion);
+      const c = mixPoint(second, end, portion);
+      const d = mixPoint(a, b, portion);
+      const tip = mixPoint(d, mixPoint(b, c, portion), portion);
+      context.bezierCurveTo(a.x, a.y, d.x, d.y, tip.x, tip.y);
+    }
     context.stroke();
   }
 
@@ -905,49 +917,125 @@ const DigitFlow = (() => {
     return parts.join('');
   }
 
-  class Preview {
-    constructor(canvas) {
-      this.canvas = canvas;
+  class PrefixInk {
+    constructor(budget) {
+      this.budget = budget;
       this.ink = document.createElement('canvas');
+      this.checkpoints = [];
+      this.saved = 0;
       this.drawn = 0;
       this.key = '';
     }
 
-    render(model, state, amount, palette, hover) {
-      const { width, height } = this.canvas;
-      const limit = Math.max(0, Math.min(model.flow.links.length, Math.floor(amount) - 1));
-      const key = [model.id, width, height, state.flowOpacity, ...palette].join('|');
-      const inkContext = this.ink.getContext('2d');
-      if (key !== this.key || limit < this.drawn) {
+    render({ key, width, height, total, limit, opacity, strokeWidth }, paint) {
+      const ctx = this.ink.getContext('2d');
+      if (key !== this.key) {
         if (this.ink.width !== width) this.ink.width = width;
         if (this.ink.height !== height) this.ink.height = height;
-        inkContext.setTransform(1, 0, 0, 1, 0, 0);
-        inkContext.clearRect(0, 0, width, height);
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, width, height);
         this.drawn = 0;
+        this.saved = 0;
+        const slots = Math.max(1, Math.min(24, Math.floor(this.budget / (width * height * 4))));
+        this.stride = Math.max(16, Math.ceil(total / slots));
+        this.checkpoints.length = Math.min(this.checkpoints.length, Math.floor(total / this.stride));
         this.key = key;
       }
-      inkContext.setTransform(width / size, 0, 0, height / size, 0, 0);
-      inkContext.lineWidth = lineWidth(model.data.length);
-      inkContext.globalAlpha = state.flowOpacity / 100;
-      for (let i = this.drawn; i < limit; i++) line(inkContext, model.flow.links[i], palette);
+      const slot = Math.min(this.saved, Math.floor(limit / this.stride));
+      const offset = slot * this.stride;
+      if (limit < this.drawn || offset > this.drawn) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalAlpha = 1;
+        ctx.clearRect(0, 0, width, height);
+        if (slot) ctx.drawImage(this.checkpoints[slot-1], 0, 0);
+        this.drawn = offset;
+      }
+      ctx.setTransform(width / size, 0, 0, height / size, 0, 0);
+      ctx.lineWidth = strokeWidth;
+      ctx.globalAlpha = opacity;
+      for (let i = this.drawn; i < limit; i++) {
+        paint(ctx, i);
+        if (i+1 === (this.saved+1)*this.stride) this.save(width, height);
+      }
       this.drawn = limit;
+      return this.ink;
+    }
+
+    save(width, height) {
+      const image = this.checkpoints[this.saved] ??= document.createElement('canvas');
+      if (image.width !== width) image.width = width;
+      if (image.height !== height) image.height = height;
+      const ctx = image.getContext('2d');
+      ctx.clearRect(0, 0, width, height);
+      ctx.drawImage(this.ink, 0, 0);
+      this.saved++;
+    }
+  }
+
+  function countBefore(indices, limit) {
+    let low = 0, high = indices.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (indices[mid] < limit) low = mid + 1;
+      else high = mid;
+    }
+    return low;
+  }
+
+  class Preview {
+    constructor(canvas) {
+      this.canvas = canvas;
+      this.base = new PrefixInk(32 * 1024 ** 2);
+      this.highlight = new PrefixInk(8 * 1024 ** 2);
+    }
+
+    render(model, state, amount, palette, hover) {
+      const { width, height } = this.canvas;
+      const { links, byDigit } = model.flow;
+      const progress = Math.max(0, Math.min(links.length, amount-1));
+      const limit = Math.floor(progress);
+      const portion = progress-limit;
+      const opacity = state.flowOpacity / 100;
+      const strokeWidth = lineWidth(model.data.length);
+      const key = [model.id, width, height, opacity, ...palette].join('|');
+      const ink = this.base.render({ key, width, height, total:links.length, limit, opacity, strokeWidth },
+        (ctx, index) => line(ctx, links[index], palette));
 
       const context = this.canvas.getContext('2d');
       background(context, width, height, state);
-      context.globalAlpha = hover === null ? 1 : .26;
-      context.drawImage(this.ink, 0, 0);
-      context.globalAlpha = 1;
+      const dim = hover === null ? 1 : .26;
+      context.globalAlpha = dim;
+      context.drawImage(ink, 0, 0);
       context.save();
       context.scale(width / size, height / size);
-      if (hover !== null) {
-        context.globalAlpha = Math.min(.9, state.flowOpacity / 100 + .28);
-        context.lineWidth = lineWidth(model.data.length) * 1.25;
-        for (const index of model.flow.byDigit[hover]) {
-          if (index >= limit) break;
-          line(context, model.flow.links[index], palette);
-        }
-        context.globalAlpha = 1;
+      const unfinished = portion > 0 ? links[limit] : null;
+      if (unfinished) {
+        context.globalAlpha = opacity * dim;
+        context.lineWidth = strokeWidth;
+        line(context, unfinished, palette, portion);
       }
+      context.restore();
+      context.globalAlpha = 1;
+      if (hover !== null) {
+        const indices = byDigit[hover];
+        const brightOpacity = Math.min(.9, opacity + .28);
+        const brightWidth = strokeWidth * 1.25;
+        const bright = this.highlight.render({
+          key:key+'|'+hover, width, height, total:indices.length, limit:countBefore(indices, limit),
+          opacity:brightOpacity, strokeWidth:brightWidth
+        }, (ctx, index) => line(ctx, links[indices[index]], palette));
+        context.drawImage(bright, 0, 0);
+        if (unfinished && (unfinished.from === hover || unfinished.to === hover)) {
+          context.save();
+          context.scale(width / size, height / size);
+          context.globalAlpha = brightOpacity;
+          context.lineWidth = brightWidth;
+          line(context, unfinished, palette, portion);
+          context.restore();
+        }
+      }
+      context.save();
+      context.scale(width / size, height / size);
       drawRim(context, model, state, palette, hover);
       context.restore();
     }
@@ -980,6 +1068,7 @@ const DigitFlow = (() => {
  const keys=Object.keys(defaults),bools=keys.filter(k=>typeof defaults[k]==='boolean');
  let flags,baseColors,model=null,valid=false,pending=false,debounce=0,animRAF=0,resizeRAF=0,mode=null,revealed=0,animStart=0,lastTime=0,lastPaint=0,carry=0,hover=null,pinned=null,hoverRAF=0,nextModelId=0,quickTimer=0,animToken=0,quickDuration=720,resumeManual=false;
  let workspaceTimer=0,workspaceSnapshot=null;
+ let seekRAF=0;
  const decCache=new Map(),canvas=$('canvas'),colorInputs=[];
  const renderer=new CachedPreview(canvas);
  const flowRenderer=new DigitFlow.Preview(canvas);
@@ -1051,7 +1140,7 @@ const DigitFlow = (() => {
   return { ...next, path, cw, ccw, indices:index(path), cwIndices:index(cw), ccwIndices:index(ccw) };
  }
  function status(text){$('status').textContent=text;$('status').title=text;}
- function stop(){++animToken;clearTimeout(quickTimer);cancelAnimationFrame(animRAF);mode=null;updateProgress();}
+ function stop(){++animToken;clearTimeout(quickTimer);cancelAnimationFrame(animRAF);cancelAnimationFrame(seekRAF);seekRAF=0;mode=null;updateProgress();}
  function disableActions(disabled){for(const id of ['play','replay','step','finish','progress','exportPNG','exportSVG','worksheet'])$(id).disabled=disabled;}
  function sync(){
   for(const id of ['gap','radius','fontScale','flowOpacity','hue','sat','light','wheelHue'])$(id+'Value').textContent=$(id).value+(['gap','radius','fontScale','flowOpacity'].includes(id)?'%':['hue','wheelHue'].includes(id)?'°':'');
@@ -1122,6 +1211,7 @@ const DigitFlow = (() => {
   const used=counts.filter(Boolean).length,sourceText=s.source==='custom'?'有限数字串重复':s.source==='cycle'?'仅取循环节':dec.irrational?'无理数 · 不循环 · 内置 '+dec.available.toLocaleString()+' 位小数':dec.finite?'有限小数，末尾补 0':dec.cycleStart>0?'小数前 '+dec.cycleStart+' 位不循环':withInteger?'按数位依次取数':'小数部分依次取数';
   $('numberInfo').textContent=(withInteger?'含整数位 · ':'')+sourceText+(s.offset?' · 跳过 '+s.offset+' 位':'')+' · '+used+' 种数字'+(s.order!=='original'?' · 当前 '+data.length+' 位整体'+({reverse:'倒序',asc:'升序',desc:'降序'}[s.order]):'');
   $('artTitle').textContent = limited(model.title.replace('/', ' / '), 28) + ' · ' + viewNames[s.view];
+  $('progress').max = model.flow ? 10000 : 1000;
   $('plateIndex').textContent = String(Object.keys(viewNames).indexOf(s.view) + 1).padStart(2, '0');
   $('artMeta').textContent = model.flow ? data.length.toLocaleString() + ' 位 / 0–9' : s.rows + '×' + s.cols + ' · ' + names[s.layout];
   $('cellCount').textContent = model.flow ? model.flow.links.length.toLocaleString() + ' 条连线' : data.length.toLocaleString() + ' 格' + (s.view === 'tiling' ? ' × ' + s.tileRepeat ** 2 + ' 块' : '');
@@ -1192,9 +1282,9 @@ const DigitFlow = (() => {
  }
  function appearance(){sync();if(pending){generate(false);return;}if(!valid||!model)return;try{model.s=current();updateColors();updateNumber();draw();rememberWorkspace();}catch(e){generate(false);}}
  function figureSize(m){return m.flow ? {w:1,h:1} : ArtEngine.scene(m,m.s);}
- function resize(){if(!model)return;const wrap=$('artWrap');if(!wrap.clientWidth||!wrap.clientHeight)return;const sc=figureSize(model),style=getComputedStyle(canvas.parentElement),mw=Math.max(1,wrap.clientWidth-parseFloat(style.paddingLeft)-parseFloat(style.paddingRight)-2),mh=Math.max(1,wrap.clientHeight-parseFloat(style.paddingTop)-parseFloat(style.paddingBottom)-2),scale=Math.min(mw/sc.w,mh/sc.h),w=Math.max(1,Math.floor(sc.w*scale)),h=Math.max(1,Math.floor(sc.h*scale)),dpr=Math.min(devicePixelRatio||1,2);canvas.style.width=w+'px';canvas.style.height=h+'px';const pw=Math.round(w*dpr),ph=Math.round(h*dpr);if(canvas.width!==pw)canvas.width=pw;if(canvas.height!==ph)canvas.height=ph;draw();}
+ function resize(){if(!model)return;const wrap=$('artWrap');if(!wrap.clientWidth||!wrap.clientHeight)return;const sc=figureSize(model),style=getComputedStyle(canvas.parentElement),mw=Math.max(1,wrap.clientWidth-parseFloat(style.paddingLeft)-parseFloat(style.paddingRight)-2),mh=Math.max(1,wrap.clientHeight-parseFloat(style.paddingTop)-parseFloat(style.paddingBottom)-2),scale=Math.min(mw/sc.w,mh/sc.h),w=Math.max(1,Math.floor(sc.w*scale)),h=Math.max(1,Math.floor(sc.h*scale)),dpr=Math.min(devicePixelRatio||1,2,model.flow?1400/Math.max(w,h):Infinity);canvas.style.width=w+'px';canvas.style.height=h+'px';const pw=Math.round(w*dpr),ph=Math.round(h*dpr);if(canvas.width!==pw)canvas.width=pw;if(canvas.height!==ph)canvas.height=ph;draw();}
  function draw(){if(!model)return;(model.flow ? flowRenderer : renderer).render(model,model.s,revealed,colors(),hover);updateProgress();}
- function updateProgress(){if(!model)return;const count=model.data.length;$('progress').value=Math.round(revealed/count*1000);$('progressValue').textContent=Math.floor(revealed)+'/'+count;$('play').textContent=mode?'Ⅱ 暂停':revealed>=count?'▶ 演示':'▶ 继续';}
+ function updateProgress(){if(!model)return;const count=model.data.length;const slider=$('progress');slider.value=Math.round(revealed/count*Number(slider.max));$('progressValue').textContent=Math.floor(revealed)+'/'+count;$('play').textContent=mode?'Ⅱ 暂停':revealed>=count?'▶ 演示':'▶ 继续';}
  const ease=x=>1-Math.pow(1-x,2.2);
  function queueTick(){const token=animToken;animRAF=requestAnimationFrame(now=>{if(token===animToken)tick(now);});}
  function durationForSpeed(){
@@ -1228,8 +1318,26 @@ const DigitFlow = (() => {
   scheduleQuickEnd(animStart);
   queueTick();
  }
- function tick(now){if(!mode||!model)return;const total=model.data.length;let next=revealed;if(mode==='quick')next=Math.min(total,Math.floor(total*ease(Math.max(0,Math.min(1,(now-animStart)/quickDuration)))));else{carry+=(now-lastTime)/1000*Number($('speed').value);next=Math.min(total,revealed+Math.floor(carry));carry-=Math.floor(carry);lastTime=now;}const interval=total>10000?32:16;if(next>=total){complete();return;}if(now-lastPaint>=interval){revealed=next;draw();lastPaint=now;}else if(mode==='manual')revealed=next;queueTick();}
- function play(){if(!valid)return;if(mode){stop();status('已暂停，可拖动进度或单步查看。');return;}if(revealed>=model.data.length)revealed=0;++animToken;mode='manual';carry=0;lastTime=performance.now();lastPaint=0;draw();status(model.flow?'按所选速度逐条连线':'按所选速度逐格填色');queueTick();}
+ function tick(now){
+  if(!mode||!model)return;
+  const total=model.data.length;
+  let next;
+  if(mode==='quick'){
+   next=total*ease(Math.max(0,Math.min(1,(now-animStart)/quickDuration)));
+   if(!model.flow)next=Math.floor(next);
+  }else{
+   const delta=Math.max(0,now-lastTime)/1000*Number($('speed').value);
+   if(model.flow)next=revealed+delta;
+   else{carry+=delta;next=revealed+Math.floor(carry);carry-=Math.floor(carry);}
+   lastTime=now;
+  }
+  if(next>=total){complete();return;}
+  const interval=total>10000?32:16;
+  if(now-lastPaint>=interval){revealed=next;draw();lastPaint=now;}
+  else if(mode==='manual')revealed=next;
+  queueTick();
+ }
+ function play(){if(!valid)return;if(mode){stop();status('已暂停，可拖动进度或单步查看。');return;}if(revealed>=model.data.length)revealed=0;cancelAnimationFrame(seekRAF);seekRAF=0;++animToken;mode='manual';carry=0;lastTime=performance.now();lastPaint=0;draw();status(model.flow?'按所选速度绘制连线':'按所选速度逐格填色');queueTick();}
  function complete(){stop();if(!model)return;revealed=model.data.length;draw();status('已显示完整图案。');}
  function inspect(e){if(!model)return;const s=model.s,rect=canvas.getBoundingClientRect();if(!rect.width||!rect.height)return;
   const px=(e.clientX-rect.left)/rect.width,py=(e.clientY-rect.top)/rect.height;
@@ -1405,11 +1513,22 @@ const DigitFlow = (() => {
   stop();
   if(!valid)return;
   if(revealed>=model.data.length)revealed=0;
-  revealed=Math.min(model.data.length,(model.flow?Math.max(revealed,1):revealed)+1);
+  revealed=Math.min(model.data.length,(model.flow?Math.max(Math.floor(revealed),1):revealed)+1);
   draw();
   status(model.flow ? '已绘制 '+(revealed-1)+' 条连线' : '已填入 '+revealed+' 格');
  };
- $('progress').oninput=()=>{const value=Number($('progress').value);stop();if(!valid)return;revealed=Math.round(value/1000*model.data.length);draw();status('当前进度 '+revealed+' / '+model.data.length+' '+(model.flow?'位':'格'));};
+ $('progress').oninput=()=>{
+  if(!valid)return;
+  const slider=$('progress');
+  const amount=Number(slider.value)/Number(slider.max)*model.data.length;
+  if(mode)stop();
+  revealed=model.flow?amount:Math.round(amount);
+  if(!seekRAF)seekRAF=requestAnimationFrame(()=>{
+   seekRAF=0;
+   draw();
+   status('当前进度 '+Math.floor(revealed)+' / '+model.data.length+' '+(model.flow?'位':'格'));
+  });
+ };
  $('exportPNG').onclick=exportPNG;$('exportSVG').onclick=exportSVG;$('worksheet').onclick=worksheet;
  $('printWorksheet').onclick=()=>window.print();
  canvas.addEventListener('pointermove',inspect);canvas.addEventListener('pointerdown',inspect);canvas.addEventListener('pointerleave',leaveHover);
